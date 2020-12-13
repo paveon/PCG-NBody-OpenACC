@@ -1,0 +1,184 @@
+/**
+ * @file      main.cpp
+ *
+ * @author    Ondřej Pavela - xpavel34
+ *            Faculty of Information Technology
+ *            Brno University of Technology
+ *            xpavel34@stud.fit.vutbr.cz
+ *
+ * @brief     PCG Assignment 2
+ *            N-Body simulation in ACC
+ *
+ * @version   2021
+ *
+ * @date      11 November  2020, 11:22 (created)
+ * @date      29 November  2020, 11:37 (revised)
+ *
+ */
+
+
+
+Krok 1: základní implementace
+===============================================================================
+Velikost dat    	čas [s]
+     1024       0.834000
+ 2 * 1024       1.598000
+ 3 * 1024       2.356000
+ 4 * 1024       3.115000
+ 5 * 1024       3.882000
+ 6 * 1024       4.641000
+ 7 * 1024       5.412000
+ 8 * 1024       6.173000
+ 9 * 1024       6.922000
+10 * 1024       7.716000
+11 * 1024       8.459000
+12 * 1024       9.229000
+13 * 1024       10.004000
+14 * 1024       20.918000
+15 * 1024       22.418000
+16 * 1024       23.903000
+17 * 1024       25.414000
+18 * 1024       26.916000
+19 * 1024       28.670000
+20 * 1024       30.172000
+21 * 1024       31.633000
+22 * 1024       33.179000
+23 * 1024       34.976000
+24 * 1024       36.554000
+25 * 1024       38.092000
+26 * 1024       39.609000
+27 * 1024       60.279000
+28 * 1024       62.618000
+29 * 1024       64.805000
+30 * 1024       67.108000
+
+Vyskytla se nějaká anomálie v datech
+Pokud ano, vysvětlete:
+
+Stejná anomálie nastala i v prvním projektu a zde se projevila
+stejným způsobem, jelikož jsem nastavil velikost bloku opět 1024 vláken,
+viz odpověď z prvního projektu:
+  Při spuštění se vstupem o velikosti 14*1024 je doba běhu více než
+  dvojnásobná oproti době běhu při spuštění se vstupem o velikosti 13*1024.
+  Stejně tak mezi velikostmi 26*1024 a 27*1024 je velký časový skok.
+  Tyto anomálie jsou způsobeny tím, že maximální počet vláken na jeden blok
+  je pro GPU Tesla K20m 1024. Zároveň má tato karta 13 SM jednotek. Díky
+  tomu se pravděpodobně při velikostech pod 14*1024 přímo mapuje jeden blok
+  na jeden multiprocesor a jsou díky tomu vytíženy všechny na jeden běh.
+  Při vyšších velikostech je poté potřeba na některé SM jednotky vložit více
+  bloků, což má za následek, že některé jednotky mají dvojnásobný objem práce.
+  Tím se alespoň zdvojnásobí doba běhu, protože se musí čekat, až svou práci
+  dokončí všechny SM jednotky.
+
+
+Krok 2: optimalizace kódu
+===============================================================================
+Došlo ke zrychlení?
+Ano. Při vstupu o velikosti 16K došlo k téměř dvojnásobnému zrychlení:
+  step 1 16K: 23.938000 s
+  step 2 16K: 12.244000 s
+
+Popište dva hlavní důvody:
+Dva hlavní důvody jsou:
+    1) menší overhead spouštění kernelů (což je ale spíše zanedbatelné),
+       díky jejich sloučení do jednoho
+    2) optimalizace výrazů, což vedlo k drastickému snížení celkového počtu
+        FP operací, zejména speciálních operací, viz tabulka.
+
+    Kromě toho, že je celkově potřeba spouštět méně kernelů, tak je snížen
+    overhead tím, že není potřeba opakovaně načítat stejná data z globální
+    paměti. To vedlo ke snížení celkového počtu load transakcí téměř na
+    polovinu oproti verzi z kroku 1. Došlo také ke snížení celkového počtu
+    globálních store transakcí, jelikož nemusíme ukládat mezivýsledky mezi
+    jednotlivými kernely. To ale pravděpodobně nemělo na výkon zase až takový
+    vliv, jelikož poměr počtu zápisů vůči načítání z globální paměti je
+    minimální.
+
+Porovnejte metriky s předchozím krokem:
+
+Následující metriky potvrzují dva hlavní důvody zrychlení.
+Došlo pouze k malému zvýšení průměrné cccupancy a sm_efficiency, ale
+celkový počet čtení z globální paměti a počet SP operací se výrazně snížil.
+Dále je vidět, že se díky sloučení kernelů podařilo výrazně snížit průměrné
+stall_memory_throttle díky eliminaci čistě LOAD/STORE intenzivního kernelu
+update_particles. Prostoje SM procesorů způsobené čekáním na data zůstaly
+v průměru víceméně stejné, jelikož nevyužíváme sdílenou paměť.
+
+                      flop_sp_efficiency  sm_efficiency  achieved_occupancy  gld_transactions  flop_count_sp  flop_count_sp_special  stall_memory_throttle  stall_memory_dependency
+                                       %              %                                                                                                  %                        %
+calculate_gravitation_velocity      4.41          30.61            0.499344           2100352      520040448               50327552                   0.05                    19.39
+calculate_collision_velocity        2.59          30.58            0.499233           1577216      251645952               16773120                   0.08                    26.41
+update_particle                     0.08          19.23            0.453984              3840          36864                      0                  32.48                    20.92
+suma:                                                                                 3681408      771723264               67100672
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+calculate_velocity                  3.96          30.56            0.499345           2100352      436178944               33546240                   0.08                    21.15
+
+
+V prvním kroku jsem se pokoušel implementovat i SoA variantu, která však byla
+téměř desetkrát pomalejší než AoS varianta. Nebyl jsem si však jistý, zda to
+bylo způsobené výrazně výšším počtem load transakcí, nebo tím, že jsem zapomněl
+ukazatele na jednotlivé složky označit pomocí klíčového slova restrict a překladač
+tak nebyl schopen rozpoznat, že zde není aliasing.
+
+
+
+Krok 3: Težiště
+===============================================================================
+Kolik kernelů je nutné použít k výpočtu?
+
+2 kernely, přičemž jeden slouží pouze pro kopírování dat do pomocné paměti.
+Druhý kernel provádí samotný výpočet těžiště pomocí paralelní redukce, kdy
+každý blok obsahuje pouze jeden warp o 32 vláknech, které zredukují 64 prvků
+do jednoho. To znamená, že abychom dostali výsledné těžiště, musíme spustit
+tento kernel log64(N)-krát, kde N je velikost vstupu.
+
+Kolik další paměti jste museli naalokovat?
+
+Musel jsem alokovat ((N + N/64) * 4 * sizeof(float)) bytů paměti,
+přičemž se jedná o dva oddělené buffery, jeden pro N a druhý pro N/64 prvků.
+Slouží jako vstupní a výstupní buffery při každém spuštění výpočetního kernelu,
+přičemž mezi jednotlivými spuštěními se vždy prohodí. Jednoduše se jedná o
+double buffering s tím rozdílem, že zde neslouží pro překrytí výpočtů a přenosů,
+ale pro zaručení toho, že mezivýsledky redukce budou vždy uloženy kontinuálně
+v poli za sebou, aby se redukoval počet potřebných čtení z paměti.
+
+Jaké je zrychelní vůči sekveční verzi?
+(provedu to smyčkou #pragma acc parallel loop seq)
+Zdůvodněte:
+
+Naivní verze výpočtu těžiště na GPU prováděná sekvenčně zabere při 1M prvků
+615.681 milisekund, přičemž výpočet s paralelní verzí při 1M prvků trvá cca
+0.840184 milisekund, což zhruba odpovídá očekávaným výsledkům  log64(615.681) = 1.544340.
+Zdůvodnění je jednoduché: v paralelní verzi může pracovat současně více než
+jedno vlákno, konkrétně v první redukční iteraci N/64 vláken, v další už jen
+N/(64^2) a tak dále. Stále je sice vytížení grafické karty minimální, ale
+alespoň jsme schopni dosáhnout vyšší úrovně paralelismu než v případě naivní
+sekvenční verze.
+
+
+
+
+Krok 4: analýza výkonu
+================================================================================
+N         čas CPU [s]  čas GPU (CUDA) [s]  čas GPU (OpenACC)  propustnost paměti [MB/s]  výkon [MFLOPS]  zrychlení [-]
+128          0.339417            0.085264              0.092                       1725            2324           3.69
+256          1.359650            0.134163              0.142                       3497            6007           9.58
+512          5.419440            0.234844              0.243                       6564           14031          22.30
+
+1024          21.6883            0.439514              0.444                      12157           30708          48.85
+2048          86.6916            0.846738              0.848                      26268           64306         102.23
+4096         346.8660            0.320459              1.663                      50659          131158         208.58
+8192        1388.3500            3.317633              3.316                      82907          263100         418.68
+16384      ~5553.4000            7.235652             12.563                     107333          277776        ~442.04
+32768     ~22213.6000           27.989716             38.220                     161425          365218        ~581.20
+65536     ~88854.4000          111.837320            130.012                     216847          429462        ~683.43
+131072   ~355417.6000          447.026254            521.850                     256651          427979        ~681.07
+
+
+Od jakého počtu částic se vyplatí počítat na grafické kartě?
+
+Jestliže bychom uvažovali, že optimalizovaná paralelní CPU verze
+by byla cca 10x rychlejší, pak by se vyplatilo počítat na grafické
+kartě cca od velikosti 512 prvků.
+
+===============================================================================
